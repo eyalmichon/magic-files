@@ -32,7 +32,9 @@ def _is_authorized(update: Update) -> bool:
 
 
 async def _reject(update: Update) -> None:
-    text = f"Unauthorized. Your user ID is {update.effective_user.id}."
+    uid = update.effective_user.id
+    logger.warning("Unauthorized access attempt from user ID %s", uid)
+    text = "This bot is private."
     if update.message:
         await update.message.reply_text(text)
     elif update.callback_query:
@@ -48,6 +50,7 @@ class State(IntEnum):
     BROWSE_FOLDER = auto()
     AWAIT_FOLDER_NAME = auto()
     AWAIT_FILE_NAME = auto()
+    AWAIT_NAME_INPUT = auto()
     CONFIRM_OVERWRITE = auto()
 
 
@@ -64,6 +67,7 @@ SELECTED_NAME = "selected_name"
 BROWSE_STACK = "browse_stack"  # list of (folder_id, folder_name)
 CONFIDENCE = "confidence"
 DOC_SUMMARY = "doc_summary"
+NAME_TEMPLATE = "name_template"
 DUPLICATE_FILE_ID = "duplicate_file_id"
 
 
@@ -105,9 +109,22 @@ def _overwrite_keyboard() -> InlineKeyboardMarkup:
 
 
 def _path_display(path: list[str], name: str) -> str:
-    if path:
-        return " > ".join(path) + " / " + name
-    return name
+    """Render folder path + file name as a vertical breadcrumb.
+
+    Uses Unicode LTR marks (\u200E) to force left-to-right rendering on each
+    line, preventing Telegram's bidi algorithm from reordering mixed
+    Hebrew/English content.
+    """
+    LTR = "\u200E"
+    if not path:
+        return f"{LTR}\U0001F4C4 {name}"
+    lines = []
+    for i, segment in enumerate(path):
+        prefix = "\u2003" * i
+        lines.append(f"{LTR}{prefix}\U0001F4C2 {segment}")
+    prefix = "\u2003" * len(path)
+    lines.append(f"{LTR}{prefix}\U0001F4C4 {name}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +140,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     doc = update.message.document
     if not doc or doc.mime_type != "application/pdf":
         await update.message.reply_text("Please send a PDF file.")
+        return ConversationHandler.END
+
+    MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
+    if doc.file_size and doc.file_size > MAX_FILE_SIZE:
+        await update.message.reply_text("File too large (max 10 MB). Please send a smaller PDF.")
         return ConversationHandler.END
 
     await update.message.reply_text("Analyzing your document...")
@@ -150,7 +172,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     path = result["path"]
     confidence = result["confidence"]
-    suggested_name = result["suggested_name"]
+    suggested_name = result.get("suggested_name")
+    needs_input = result.get("needs_input")
+    name_template = result.get("name_template")
 
     tree = drive.list_folder_tree()
     folder_id = drive.resolve_path(path, tree)
@@ -166,8 +190,20 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     context.user_data[SELECTED_NAME] = suggested_name
     context.user_data[CONFIDENCE] = confidence
     context.user_data[DOC_SUMMARY] = result.get("doc_summary", "")
+    context.user_data[NAME_TEMPLATE] = name_template
 
-    display = _path_display(path, suggested_name)
+    if needs_input and name_template:
+        path_display = _path_display(path, name_template.replace("{input}", "___"))
+        await update.message.reply_text(
+            f"I found the folder but need one detail for the name:\n\n"
+            f"{path_display}\n\n"
+            f"\U00002753 {needs_input}"
+        )
+        return State.AWAIT_NAME_INPUT
+
+    display_name = suggested_name or context.user_data[PDF_FILENAME]
+    context.user_data[SELECTED_NAME] = display_name
+    display = _path_display(path, display_name)
     if confidence == "low":
         msg = f"I'm not sure where this belongs. Best guess:\n\n{display}"
     else:
@@ -184,6 +220,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def handle_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """User tapped Save."""
     query = update.callback_query
+    if not _is_authorized(update):
+        await query.answer("Unauthorized.", show_alert=True)
+        return ConversationHandler.END
     await query.answer()
 
     folder_id = context.user_data[SELECTED_FOLDER_ID]
@@ -248,9 +287,10 @@ async def handle_new_folder(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     """User tapped New Folder."""
     query = update.callback_query
     await query.answer()
-    path_str = " > ".join(context.user_data.get(SELECTED_FOLDER_PATH, [])) or "Files"
+    path_parts = context.user_data.get(SELECTED_FOLDER_PATH, [])
+    path_str = "\n".join(f"\u200E{'\u2003' * i}\U0001F4C2 {p}" for i, p in enumerate(path_parts)) if path_parts else "\u200E\U0001F4C2 Files"
     await query.edit_message_text(
-        f"Type the new folder name (will be created inside {path_str}):"
+        f"Type the new folder name (will be created inside):\n\n{path_str}"
     )
     return State.AWAIT_FOLDER_NAME
 
@@ -261,6 +301,62 @@ async def handle_rename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     await query.answer()
     await query.edit_message_text("Type the new file name:")
     return State.AWAIT_FILE_NAME
+
+
+# ---------------------------------------------------------------------------
+# AWAIT_NAME_INPUT state — user provides missing info for the name
+# ---------------------------------------------------------------------------
+
+async def handle_name_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """User typed the missing info (e.g. billing period) for the file name."""
+    user_input = update.message.text.strip()
+    template = context.user_data.get(NAME_TEMPLATE, "{input}.pdf")
+    name = template.replace("{input}", user_input)
+
+    context.user_data[SELECTED_NAME] = name
+    path = context.user_data.get(SELECTED_FOLDER_PATH, [])
+    display = _path_display(path, name)
+
+    await update.message.reply_text(
+        f"Got it! I'd save this as:\n\n{display}",
+        reply_markup=_suggestion_keyboard(),
+    )
+    return State.SUGGESTION
+
+
+async def _re_suggest_and_reply(
+    query, context: ContextTypes.DEFAULT_TYPE,
+    folder_id: str, path_names: list[str],
+) -> int:
+    """Re-run name suggestion for a newly selected folder and reply."""
+    try:
+        siblings = drive.list_files(folder_id)
+        doc_summary = context.user_data.get(DOC_SUMMARY, "")
+        if doc_summary:
+            name_result = await gemini.suggest_name(doc_summary, siblings)
+            if name_result.get("needs_input") and name_result.get("template"):
+                context.user_data[NAME_TEMPLATE] = name_result["template"]
+                path_display = _path_display(
+                    path_names,
+                    name_result["template"].replace("{input}", "___"),
+                )
+                await query.edit_message_text(
+                    f"I found the folder but need one detail for the name:\n\n"
+                    f"{path_display}\n\n"
+                    f"\U00002753 {name_result['needs_input']}"
+                )
+                return State.AWAIT_NAME_INPUT
+            context.user_data[SELECTED_NAME] = name_result.get("name") or context.user_data.get(SELECTED_NAME)
+    except Exception:
+        logger.exception("Name re-suggestion failed")
+
+    name = context.user_data[SELECTED_NAME]
+    display = _path_display(path_names, name)
+    await query.edit_message_text(
+        f"Updated:\n\n{display}",
+        reply_markup=_suggestion_keyboard(),
+    )
+    return State.SUGGESTION
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +375,7 @@ async def handle_folder_browse(update: Update, context: ContextTypes.DEFAULT_TYP
             stack.pop()
         parent_id, parent_name = stack[-1]
         children = drive.get_children(parent_id)
-        breadcrumb = " > ".join(name for _, name in stack) + " /"
+        breadcrumb = "\n".join(f"\u200E{'\u2003' * i}\U0001F4C2 {name}" for i, (_, name) in enumerate(stack))
         show_select = len(stack) > 1
         await query.edit_message_text(
             f"Select a folder:\n\n{breadcrumb}",
@@ -289,27 +385,11 @@ async def handle_folder_browse(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if data == "select_here":
         folder_id, folder_name = stack[-1]
-        path_names = [name for _, name in stack[1:]]  # skip "Files" root label
+        path_names = [name for _, name in stack[1:]]
         context.user_data[SELECTED_FOLDER_ID] = folder_id
         context.user_data[SELECTED_FOLDER_PATH] = path_names
 
-        # Re-suggest name for new folder
-        try:
-            siblings = drive.list_files(folder_id)
-            doc_summary = context.user_data.get(DOC_SUMMARY, "")
-            if doc_summary:
-                new_name = await gemini.suggest_name(doc_summary, siblings)
-                context.user_data[SELECTED_NAME] = new_name
-        except Exception:
-            logger.exception("Name re-suggestion failed")
-
-        name = context.user_data[SELECTED_NAME]
-        display = _path_display(path_names, name)
-        await query.edit_message_text(
-            f"Updated:\n\n{display}",
-            reply_markup=_suggestion_keyboard(),
-        )
-        return State.SUGGESTION
+        return await _re_suggest_and_reply(query, context, folder_id, path_names)
 
     if data.startswith("folder:"):
         parts = data.split(":", 2)
@@ -319,30 +399,14 @@ async def handle_folder_browse(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data[BROWSE_STACK] = stack
 
         children = drive.get_children(folder_id)
-        breadcrumb = " > ".join(name for _, name in stack) + " /"
+        breadcrumb = "\n".join(f"\u200E{'\u2003' * i}\U0001F4C2 {name}" for i, (_, name) in enumerate(stack))
 
         if not children:
-            # Leaf folder — auto-select
             path_names = [name for _, name in stack[1:]]
             context.user_data[SELECTED_FOLDER_ID] = folder_id
             context.user_data[SELECTED_FOLDER_PATH] = path_names
 
-            try:
-                siblings = drive.list_files(folder_id)
-                doc_summary = context.user_data.get(DOC_SUMMARY, "")
-                if doc_summary:
-                    new_name = await gemini.suggest_name(doc_summary, siblings)
-                    context.user_data[SELECTED_NAME] = new_name
-            except Exception:
-                logger.exception("Name re-suggestion failed")
-
-            name = context.user_data[SELECTED_NAME]
-            display = _path_display(path_names, name)
-            await query.edit_message_text(
-                f"Updated:\n\n{display}",
-                reply_markup=_suggestion_keyboard(),
-            )
-            return State.SUGGESTION
+            return await _re_suggest_and_reply(query, context, folder_id, path_names)
 
         await query.edit_message_text(
             f"Select a folder:\n\n{breadcrumb}",
@@ -411,6 +475,9 @@ async def handle_file_rename(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def handle_overwrite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
+    if not _is_authorized(update):
+        await query.answer("Unauthorized.", show_alert=True)
+        return ConversationHandler.END
     await query.answer()
 
     name = context.user_data[SELECTED_NAME]
@@ -481,7 +548,8 @@ def _cleanup_user_data(context: ContextTypes.DEFAULT_TYPE) -> None:
     for key in (
         PDF_BYTES, PDF_FILENAME, SUGGESTED_PATH, SUGGESTED_NAME,
         SELECTED_FOLDER_ID, SELECTED_FOLDER_PATH, SELECTED_NAME,
-        BROWSE_STACK, CONFIDENCE, DOC_SUMMARY, DUPLICATE_FILE_ID,
+        BROWSE_STACK, CONFIDENCE, DOC_SUMMARY, NAME_TEMPLATE,
+        DUPLICATE_FILE_ID,
     ):
         context.user_data.pop(key, None)
 
@@ -489,6 +557,15 @@ def _cleanup_user_data(context: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------------------------------------------------------------------------
 # Build the ConversationHandler
 # ---------------------------------------------------------------------------
+
+async def _timeout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Clean up user data when conversation times out."""
+    _cleanup_user_data(context)
+    return ConversationHandler.END
+
+
+CONVERSATION_TIMEOUT = 600  # 10 minutes
+
 
 def build_conversation_handler() -> ConversationHandler:
     return ConversationHandler(
@@ -511,6 +588,9 @@ def build_conversation_handler() -> ConversationHandler:
             State.AWAIT_FILE_NAME: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_file_rename),
             ],
+            State.AWAIT_NAME_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_name_input),
+            ],
             State.CONFIRM_OVERWRITE: [
                 CallbackQueryHandler(handle_overwrite),
             ],
@@ -518,5 +598,6 @@ def build_conversation_handler() -> ConversationHandler:
         fallbacks=[
             CommandHandler("cancel", cancel),
         ],
+        conversation_timeout=CONVERSATION_TIMEOUT,
         allow_reentry=True,
     )
