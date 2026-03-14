@@ -20,14 +20,10 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaInMemoryUpload
 
-from bot import config
+from bot.oauth import CLIENT_CONFIG, SCOPES
+from bot.state import get_state
 
 logger = logging.getLogger(__name__)
-
-SCOPES = [
-    "https://www.googleapis.com/auth/drive.readonly",
-    "https://www.googleapis.com/auth/drive.file",
-]
 
 APP_PROPERTY_KEY = "uploaded_by"
 APP_PROPERTY_VAL = "drive-bot"
@@ -71,9 +67,8 @@ def _get_credentials():
     except Exception:
         pass
 
-    # 3) Fall back to saved token / OAuth flow with credentials.json
+    # 3) Fall back to saved token / interactive OAuth flow
     token_path = base / "token.json"
-    creds_path = base / "credentials.json"
 
     creds = None
     if token_path.exists():
@@ -83,15 +78,8 @@ def _get_credentials():
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            if not creds_path.exists():
-                raise FileNotFoundError(
-                    "No credentials found. Options:\n"
-                    "  1. Place a service account key at secrets/adc.json\n"
-                    "  2. Run: gcloud auth application-default login\n"
-                    f"  3. Place OAuth credentials at {creds_path}"
-                )
-            flow = InstalledAppFlow.from_client_secrets_file(str(creds_path), SCOPES)
-            creds = flow.run_local_server(port=0)
+            flow = InstalledAppFlow.from_client_config(CLIENT_CONFIG, SCOPES)
+            creds = flow.run_local_server(port=0, open_browser=False)
         token_path.write_text(creds.to_json())
 
     return creds
@@ -139,7 +127,7 @@ def list_folder_tree(parent_id: str | None = None, *, force: bool = False) -> li
         [{"id": "...", "name": "...", "children": [...]}, ...]
     """
     if parent_id is None:
-        parent_id = config.get("root_folder_id")
+        parent_id = get_state().root_folder_id
 
     now = time.time()
     if not force and parent_id in _folder_cache:
@@ -164,7 +152,7 @@ def list_folder_tree(parent_id: str | None = None, *, force: bool = False) -> li
 def get_children(parent_id: str | None = None) -> list[dict]:
     """Return immediate child folders (id + name) of *parent_id*."""
     if parent_id is None:
-        parent_id = config.get("root_folder_id")
+        parent_id = get_state().root_folder_id
     return _list_children_folders(parent_id)
 
 
@@ -309,7 +297,7 @@ def resolve_path(path: list[str], tree: list[dict] | None = None) -> str | None:
     if tree is None:
         tree = list_folder_tree()
     if not path:
-        return config.get("root_folder_id")
+        return get_state().root_folder_id
 
     name = path[0]
     for node in tree:

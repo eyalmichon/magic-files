@@ -1,69 +1,28 @@
 from __future__ import annotations
 
-import os
-import re
+from functools import cache
 from pathlib import Path
-from typing import Any
 
-import yaml
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
-_ENV_VAR_RE = re.compile(r"\$\{(\w+)\}")
-_CONFIG: dict[str, Any] | None = None
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
-def _resolve_env_vars(value: Any) -> Any:
-    """Replace ${VAR} placeholders with environment variable values."""
-    if isinstance(value, str):
-        def _replacer(match: re.Match) -> str:
-            var_name = match.group(1)
-            env_val = os.environ.get(var_name)
-            if env_val is None:
-                raise ValueError(
-                    f"Environment variable '{var_name}' is not set. "
-                    f"Set it before running: export {var_name}=<value>"
-                )
-            return env_val
-        return _ENV_VAR_RE.sub(_replacer, value)
-    if isinstance(value, dict):
-        return {k: _resolve_env_vars(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_resolve_env_vars(v) for v in value]
-    return value
+class Settings(BaseSettings):
+    """Secrets and static config — loaded from .env / environment variables."""
+
+    model_config = SettingsConfigDict(
+        env_file=str(_PROJECT_ROOT / ".env"),
+    )
+
+    telegram_bot_token: str
+    gemini_api_key: str
+    admin_telegram_id: int | None = None
+    gemini_model: str = "gemini-2.5-flash"
+    max_file_size_mb: int = 10
+    conversation_timeout_sec: int = 600
 
 
-def load_config(path: str | Path | None = None) -> dict[str, Any]:
-    """Load and cache config from YAML, resolving env-var placeholders."""
-    global _CONFIG
-    if _CONFIG is not None:
-        return _CONFIG
-
-    if path is None:
-        path = Path(__file__).resolve().parent.parent / "config.yaml"
-    else:
-        path = Path(path)
-
-    with open(path) as f:
-        raw = yaml.safe_load(f)
-
-    _CONFIG = _resolve_env_vars(raw)
-    return _CONFIG
-
-
-def get(key: str, default: Any = _SENTINEL := object()) -> Any:
-    """Shortcut to fetch a single top-level config value."""
-    cfg = load_config()
-    if key not in cfg:
-        if default is not _SENTINEL:
-            return default
-        raise KeyError(f"Missing config key: '{key}'")
-    return cfg[key]
-
-
-def set_and_save(key: str, value: Any) -> None:
-    """Update a config key in memory and persist to disk."""
-    cfg = load_config()
-    cfg[key] = value
-
-    path = Path(__file__).resolve().parent.parent / "config.yaml"
-    with open(path, "w") as f:
-        yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+@cache
+def get_settings() -> Settings:
+    return Settings()

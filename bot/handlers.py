@@ -14,7 +14,9 @@ from telegram.ext import (
     filters,
 )
 
-from bot import config, drive, gemini
+from bot import drive, gemini
+from bot.config import get_settings
+from bot.state import get_state
 
 logger = logging.getLogger(__name__)
 
@@ -24,17 +26,19 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _is_first_run() -> bool:
-    allowed = config.get("allowed_user_ids", [])
-    return not allowed
+    return not get_state().allowed_user_ids
 
 
 def _is_authorized(update: Update) -> bool:
     user = update.effective_user
     if not user:
         return False
-    allowed = config.get("allowed_user_ids", [])
+    allowed = get_state().allowed_user_ids
     if not allowed:
-        return True  # first-run: allow anyone (will register on /start)
+        admin_id = get_settings().admin_telegram_id
+        if admin_id:
+            return user.id == admin_id
+        return True
     return user.id in allowed
 
 
@@ -145,7 +149,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _reject(update)
         return ConversationHandler.END
 
-    if not config.get("root_folder_id", None):
+    if not get_state().root_folder_id:
         await update.message.reply_text(
             "Root folder not set yet. Run /setup first."
         )
@@ -156,9 +160,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("Please send a PDF file.")
         return ConversationHandler.END
 
-    MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
-    if doc.file_size and doc.file_size > MAX_FILE_SIZE:
-        await update.message.reply_text("File too large (max 10 MB). Please send a smaller PDF.")
+    max_size = get_settings().max_file_size_mb * 1024 * 1024
+    if doc.file_size and doc.file_size > max_size:
+        await update.message.reply_text(f"File too large (max {get_settings().max_file_size_mb} MB). Please send a smaller PDF.")
         return ConversationHandler.END
 
     await update.message.reply_text("Analyzing your document...")
@@ -193,7 +197,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     tree = drive.list_folder_tree()
     folder_id = drive.resolve_path(path, tree)
     if folder_id is None:
-        folder_id = config.get("root_folder_id")
+        folder_id = get_state().root_folder_id
         path = []
         confidence = "low"
 
@@ -282,7 +286,7 @@ async def handle_change_folder(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.answer()
 
-    root_id = config.get("root_folder_id")
+    root_id = get_state().root_folder_id
     children = drive.get_children(root_id)
     context.user_data[BROWSE_STACK] = [(root_id, "Files")]
 
@@ -557,16 +561,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
 
     if _is_first_run():
-        config.set_and_save("allowed_user_ids", [user.id])
+        state = get_state()
+        state.allowed_user_ids = [user.id]
+        state.save()
         logger.info("First-run: registered user %s (%s) as admin", user.id, user.full_name)
-        await update.message.reply_text(
-            f"Welcome! You've been registered as the admin (ID: {user.id}).\n\n"
-            "Let's set up your root Drive folder. Use /setup to pick one, "
-            "or send me a PDF to get started."
-        )
-        return
 
-    root = config.get("root_folder_id", None)
+    root = get_state().root_folder_id
     if not root:
         await update.message.reply_text(
             "Almost ready! Run /setup to pick your root Drive folder."
@@ -606,9 +606,10 @@ async def setup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await update.message.reply_text("No folders found in your Drive root.")
         return ConversationHandler.END
 
+    context.user_data["setup_folders"] = folders
     rows = []
-    for f in folders:
-        rows.append([InlineKeyboardButton(f"\U0001F4C2 {f['name']}", callback_data=f"setup_folder:{f['id']}:{f['name']}")])
+    for i, f in enumerate(folders):
+        rows.append([InlineKeyboardButton(f"\u200E\U0001F4C2 {f['name']}", callback_data=f"sf:{i}")])
 
     await update.message.reply_text(
         "Pick the root folder where all your documents are stored:",
@@ -623,14 +624,19 @@ async def handle_setup_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await query.answer()
     data = query.data
 
-    if not data.startswith("setup_folder:"):
+    if not data.startswith("sf:"):
         return State.SETUP_PICK_ROOT
 
-    parts = data.split(":", 2)
-    folder_id = parts[1]
-    folder_name = parts[2] if len(parts) > 2 else "?"
+    idx = int(data.split(":")[1])
+    folders = context.user_data.get("setup_folders", [])
+    if idx >= len(folders):
+        return State.SETUP_PICK_ROOT
+    folder_id = folders[idx]["id"]
+    folder_name = folders[idx]["name"]
 
-    config.set_and_save("root_folder_id", folder_id)
+    state = get_state()
+    state.root_folder_id = folder_id
+    state.save()
     drive.invalidate_cache()
     logger.info("Setup: root folder set to %s (%s)", folder_name, folder_id)
 
@@ -661,7 +667,6 @@ async def _timeout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
-CONVERSATION_TIMEOUT = 600  # 10 minutes
 
 
 def build_setup_handler() -> ConversationHandler:
@@ -671,7 +676,7 @@ def build_setup_handler() -> ConversationHandler:
         ],
         states={
             State.SETUP_PICK_ROOT: [
-                CallbackQueryHandler(handle_setup_pick, pattern=r"^setup_folder:"),
+                CallbackQueryHandler(handle_setup_pick, pattern=r"^sf:"),
             ],
         },
         fallbacks=[
@@ -711,6 +716,6 @@ def build_conversation_handler() -> ConversationHandler:
         fallbacks=[
             CommandHandler("cancel", cancel),
         ],
-        conversation_timeout=CONVERSATION_TIMEOUT,
+        conversation_timeout=get_settings().conversation_timeout_sec,
         allow_reentry=True,
     )

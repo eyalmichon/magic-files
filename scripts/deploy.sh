@@ -39,11 +39,12 @@ fi
 cd "$DEPLOY_DIR"
 
 # ── Config ───────────────────────────────────────────────────────────────────
-if [[ -f "${DEPLOY_DIR}/config.yaml" ]]; then
-  msg "config.yaml already exists (not overwriting)"
+ENV_FILE="${DEPLOY_DIR}/.env"
+
+if [[ -f "$ENV_FILE" ]]; then
+  msg ".env already exists (not overwriting)"
 else
   header "Configuration"
-  echo " The bot only needs 2 keys. Everything else is configured via Telegram."
   echo ""
 
   read -rp " Telegram bot token (from @BotFather): " TG_TOKEN
@@ -52,90 +53,43 @@ else
   read -rp " Gemini API key (from aistudio.google.com): " GEMINI_KEY
   [[ -z "$GEMINI_KEY" ]] && err "Gemini API key is required."
 
-  read -rp " Gemini model [gemini-2.5-flash]: " GEMINI_MODEL
-  GEMINI_MODEL="${GEMINI_MODEL:-gemini-2.5-flash}"
+  read -rp " Your Telegram user ID (send /start to @userinfobot): " ADMIN_ID
+  [[ -z "$ADMIN_ID" ]] && err "Admin Telegram ID is required."
 
-  cat > "${DEPLOY_DIR}/config.yaml" << YAML
-telegram_bot_token: "${TG_TOKEN}"
-gemini_api_key: "${GEMINI_KEY}"
-gemini_model: "${GEMINI_MODEL}"
-allowed_user_ids: []
-YAML
-  msg "config.yaml created"
-  info "On first /start, the bot will register you as admin and walk you through setup"
+  cat > "$ENV_FILE" << EOF
+TELEGRAM_BOT_TOKEN=${TG_TOKEN}
+GEMINI_API_KEY=${GEMINI_KEY}
+ADMIN_TELEGRAM_ID=${ADMIN_ID}
+EOF
+  msg ".env created"
 fi
 
-# ── Google credentials ───────────────────────────────────────────────────────
-SECRETS_DIR="${DEPLOY_DIR}/secrets"
-mkdir -p "$SECRETS_DIR"
-
+# ── Google Drive authorization ────────────────────────────────────────────────
 TOKEN_PATH="${DEPLOY_DIR}/token.json"
-OAUTH_CREDS="${DEPLOY_DIR}/credentials.json"
 
 if [[ -f "$TOKEN_PATH" ]]; then
   msg "Google Drive already authorized"
-elif [[ -f "${SECRETS_DIR}/adc.json" ]]; then
-  msg "Google credentials already in place"
 else
   header "Google Drive Authorization"
   echo ""
   echo " The bot needs access to your Google Drive."
-  echo " You'll need an OAuth client ID from GCP Console."
+  echo " A browser window will open (or a URL will be printed)."
+  echo " Sign in with Google and click Allow."
   echo ""
 
-  if [[ ! -f "$OAUTH_CREDS" ]]; then
-    echo " If you don't have one yet:"
-    echo "   1. Go to https://console.cloud.google.com/apis/credentials"
-    echo "   2. Create Credentials → OAuth client ID → Desktop app"
-    echo "   3. Download the JSON"
-    echo ""
-    echo " Paste the OAuth client JSON below (then press Enter + Ctrl+D):"
-    echo ""
-
-    CLIENT_JSON=$(cat)
-
-    if [[ -n "$CLIENT_JSON" ]]; then
-      echo "$CLIENT_JSON" > "$OAUTH_CREDS"
-      msg "OAuth client saved"
-    else
-      err "OAuth client JSON is required for Drive access."
-    fi
-  fi
+  info "Building image..."
+  cd "$DEPLOY_DIR"
+  docker build -t "${SERVICE_NAME}" . -q
 
   info "Starting authorization flow..."
-  cd "$DEPLOY_DIR"
+  touch "$TOKEN_PATH"
   docker run --rm -it \
-    -v "${OAUTH_CREDS}:/app/credentials.json:ro" \
-    -v "${DEPLOY_DIR}:/app/output" \
-    python:3.12-slim bash -c "
-      pip install -q google-auth-oauthlib && \
-      python3 -c \"
-from google_auth_oauthlib.flow import InstalledAppFlow
-from pathlib import Path
+    -p 8080:8080 \
+    -v "${TOKEN_PATH}:/app/token.json" \
+    "${SERVICE_NAME}" \
+    uv run python -m scripts.auth_drive /app/token.json
 
-flow = InstalledAppFlow.from_client_secrets_file('/app/credentials.json', [
-    'https://www.googleapis.com/auth/drive.readonly',
-    'https://www.googleapis.com/auth/drive.file',
-])
-flow.redirect_uri = 'urn:ietf:wg:oauth:2.0:oob'
-auth_url, _ = flow.authorization_url(prompt='consent')
-
-print()
-print('Open this URL in any browser and authorize:')
-print()
-print(f'  {auth_url}')
-print()
-code = input('Paste the authorization code here: ').strip()
-flow.fetch_token(code=code)
-Path('/app/output/token.json').write_text(flow.credentials.to_json())
-print('Authorized!')
-\"
-    "
-
-  [[ -f "$TOKEN_PATH" ]] && msg "Drive authorized" || err "Authorization failed"
-
-  rm -f "$OAUTH_CREDS"
-  msg "OAuth client JSON cleaned up"
+  [[ -s "$TOKEN_PATH" ]] && msg "Drive authorized" || err "Authorization failed"
 fi
 
 # ── Register in docker-compose.yml ───────────────────────────────────────────
@@ -169,11 +123,14 @@ if compose_file.exists():
 if "services" not in data or data["services"] is None:
     data["services"] = {}
 
-volumes = [f"{build_dir}/config.yaml:/app/config.yaml:ro"]
+volumes = [f"{build_dir}/.env:/app/.env:ro"]
 token = Path(build_dir) / "token.json"
+state = Path(build_dir) / "state.json"
 secrets = Path(build_dir) / "secrets"
 if token.exists():
     volumes.append(f"{build_dir}/token.json:/app/token.json:ro")
+if state.exists():
+    volumes.append(f"{build_dir}/state.json:/app/state.json")
 if secrets.exists():
     volumes.append(f"{build_dir}/secrets:/app/secrets:ro")
 

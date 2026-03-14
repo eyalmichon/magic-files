@@ -5,11 +5,12 @@
 .dockerignore
 __pycache__/
 *.pyc
-scripts/
+scripts/deploy.sh
+.env
 config.yaml
 secrets/
 token.json
-credentials.json
+state.json
 cleanup_token.json
 cleanup_log.json
 README.md

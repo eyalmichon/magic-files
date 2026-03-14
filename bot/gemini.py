@@ -15,8 +15,8 @@ from typing import Any
 from google import genai
 from google.genai import types
 
-from bot import config
-from bot.drive import folder_tree_to_text, list_files, list_folder_tree
+from bot.config import get_settings
+from bot.drive import folder_tree_to_text, list_files, list_folder_tree, resolve_path
 
 logger = logging.getLogger(__name__)
 
@@ -82,12 +82,12 @@ Response schema (always include all three fields):
 def _get_client() -> genai.Client:
     global _client
     if _client is None:
-        _client = genai.Client(api_key=config.get("gemini_api_key"))
+        _client = genai.Client(api_key=get_settings().gemini_api_key)
     return _client
 
 
 def _model() -> str:
-    return config.get("gemini_model")
+    return get_settings().gemini_model
 
 
 async def analyze_folder(pdf_bytes: bytes, filename: str) -> dict[str, Any]:
@@ -168,7 +168,7 @@ async def suggest_name(
     )
 
     result = json.loads(response.text)
-    logger.info("Gemini name suggestion: %s", result)
+    logger.debug("Gemini name suggestion: %s", result)
     return {
         "name": result.get("name"),
         "needs_input": result.get("needs_input"),
@@ -221,7 +221,7 @@ async def analyze_pdf(pdf_bytes: bytes, filename: str) -> dict[str, Any]:
         )
 
         step1 = json.loads(response.text)
-        logger.info("Gemini step 1: %s", step1)
+        logger.debug("Gemini step 1: %s", step1)
 
     finally:
         Path(tmp_path).unlink(missing_ok=True)
@@ -231,7 +231,6 @@ async def analyze_pdf(pdf_bytes: bytes, filename: str) -> dict[str, Any]:
             pass
 
     # Resolve folder and fetch siblings for step 2
-    from bot.drive import resolve_path
     folder_id = resolve_path(step1.get("path", []), tree)
 
     sibling_names: list[str] = []

@@ -7,7 +7,8 @@ import sys
 from telegram import Update
 from telegram.ext import Application, CommandHandler
 
-from bot import config
+from bot.config import get_settings
+from bot.drive import get_service
 from bot.handlers import build_conversation_handler, build_setup_handler, start
 
 logging.basicConfig(
@@ -21,10 +22,8 @@ logger = logging.getLogger(__name__)
 
 
 def main() -> None:
-    token = config.get("telegram_bot_token")
+    token = get_settings().telegram_bot_token
 
-    # Pre-warm Drive auth so the OAuth browser flow happens at startup
-    from bot.drive import get_service
     logger.info("Authenticating with Google Drive...")
     get_service()
     logger.info("Drive auth OK")
