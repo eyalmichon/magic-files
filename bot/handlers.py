@@ -1,0 +1,522 @@
+"""Telegram bot handlers — PDF receive, folder navigation, save flow."""
+from __future__ import annotations
+
+import logging
+from enum import IntEnum, auto
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+)
+
+from bot import config, drive, gemini
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Auth — reject messages from unknown users
+# ---------------------------------------------------------------------------
+
+def _is_authorized(update: Update) -> bool:
+    user = update.effective_user
+    if not user:
+        return False
+    allowed = config.get("allowed_user_ids")
+    return user.id in allowed
+
+
+async def _reject(update: Update) -> None:
+    text = f"Unauthorized. Your user ID is {update.effective_user.id}."
+    if update.message:
+        await update.message.reply_text(text)
+    elif update.callback_query:
+        await update.callback_query.answer(text, show_alert=True)
+
+
+# ---------------------------------------------------------------------------
+# Conversation states
+# ---------------------------------------------------------------------------
+
+class State(IntEnum):
+    SUGGESTION = auto()
+    BROWSE_FOLDER = auto()
+    AWAIT_FOLDER_NAME = auto()
+    AWAIT_FILE_NAME = auto()
+    CONFIRM_OVERWRITE = auto()
+
+
+# ---------------------------------------------------------------------------
+# User-data keys
+# ---------------------------------------------------------------------------
+PDF_BYTES = "pdf_bytes"
+PDF_FILENAME = "pdf_filename"
+SUGGESTED_PATH = "suggested_path"
+SUGGESTED_NAME = "suggested_name"
+SELECTED_FOLDER_ID = "selected_folder_id"
+SELECTED_FOLDER_PATH = "selected_folder_path"
+SELECTED_NAME = "selected_name"
+BROWSE_STACK = "browse_stack"  # list of (folder_id, folder_name)
+CONFIDENCE = "confidence"
+DOC_SUMMARY = "doc_summary"
+DUPLICATE_FILE_ID = "duplicate_file_id"
+
+
+# ---------------------------------------------------------------------------
+# Keyboard builders
+# ---------------------------------------------------------------------------
+
+def _suggestion_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Save", callback_data="save")],
+        [
+            InlineKeyboardButton("Change Folder", callback_data="change_folder"),
+            InlineKeyboardButton("New Folder", callback_data="new_folder"),
+        ],
+        [InlineKeyboardButton("Rename", callback_data="rename")],
+    ])
+
+
+def _folder_keyboard(children: list[dict], show_select_here: bool = True) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for child in children:
+        rows.append([InlineKeyboardButton(child["name"], callback_data=f"folder:{child['id']}:{child['name']}")])
+
+    bottom_row: list[InlineKeyboardButton] = []
+    if show_select_here:
+        bottom_row.append(InlineKeyboardButton("Select This Folder", callback_data="select_here"))
+    bottom_row.append(InlineKeyboardButton("Back", callback_data="back"))
+    rows.append(bottom_row)
+    return InlineKeyboardMarkup(rows)
+
+
+def _overwrite_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Yes, overwrite", callback_data="overwrite_yes"),
+            InlineKeyboardButton("No, save as copy", callback_data="overwrite_no"),
+        ]
+    ])
+
+
+def _path_display(path: list[str], name: str) -> str:
+    if path:
+        return " > ".join(path) + " / " + name
+    return name
+
+
+# ---------------------------------------------------------------------------
+# Entry: receive PDF
+# ---------------------------------------------------------------------------
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Entry point — user sends a PDF."""
+    if not _is_authorized(update):
+        await _reject(update)
+        return ConversationHandler.END
+
+    doc = update.message.document
+    if not doc or doc.mime_type != "application/pdf":
+        await update.message.reply_text("Please send a PDF file.")
+        return ConversationHandler.END
+
+    await update.message.reply_text("Analyzing your document...")
+
+    tg_file = await doc.get_file()
+    pdf_bytes = await tg_file.download_as_bytearray()
+    pdf_bytes = bytes(pdf_bytes)
+
+    context.user_data[PDF_BYTES] = pdf_bytes
+    context.user_data[PDF_FILENAME] = doc.file_name or "document.pdf"
+
+    try:
+        result = await gemini.analyze_pdf(pdf_bytes, context.user_data[PDF_FILENAME])
+    except Exception:
+        logger.exception("Gemini analysis failed")
+        await update.message.reply_text(
+            "Sorry, I couldn't analyze this document. You can still file it manually."
+        )
+        result = {
+            "path": [],
+            "confidence": "low",
+            "suggested_name": context.user_data[PDF_FILENAME],
+            "doc_summary": "",
+        }
+
+    path = result["path"]
+    confidence = result["confidence"]
+    suggested_name = result["suggested_name"]
+
+    tree = drive.list_folder_tree()
+    folder_id = drive.resolve_path(path, tree)
+    if folder_id is None:
+        folder_id = config.get("root_folder_id")
+        path = []
+        confidence = "low"
+
+    context.user_data[SUGGESTED_PATH] = path
+    context.user_data[SUGGESTED_NAME] = suggested_name
+    context.user_data[SELECTED_FOLDER_ID] = folder_id
+    context.user_data[SELECTED_FOLDER_PATH] = path
+    context.user_data[SELECTED_NAME] = suggested_name
+    context.user_data[CONFIDENCE] = confidence
+    context.user_data[DOC_SUMMARY] = result.get("doc_summary", "")
+
+    display = _path_display(path, suggested_name)
+    if confidence == "low":
+        msg = f"I'm not sure where this belongs. Best guess:\n\n{display}"
+    else:
+        msg = f"I'd save this as:\n\n{display}"
+
+    await update.message.reply_text(msg, reply_markup=_suggestion_keyboard())
+    return State.SUGGESTION
+
+
+# ---------------------------------------------------------------------------
+# SUGGESTION state — handle action buttons
+# ---------------------------------------------------------------------------
+
+async def handle_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """User tapped Save."""
+    query = update.callback_query
+    await query.answer()
+
+    folder_id = context.user_data[SELECTED_FOLDER_ID]
+    name = context.user_data[SELECTED_NAME]
+    pdf_bytes = context.user_data[PDF_BYTES]
+
+    exists, is_ours, file_id = drive.check_duplicate(name, folder_id)
+
+    if exists and is_ours:
+        context.user_data[DUPLICATE_FILE_ID] = file_id
+        await query.edit_message_text(
+            f"A file named **{name}** already exists (uploaded by this bot).\n\nOverwrite it?",
+            reply_markup=_overwrite_keyboard(),
+            parse_mode="Markdown",
+        )
+        return State.CONFIRM_OVERWRITE
+
+    if exists:
+        # Not ours — append suffix
+        base, _, ext = name.rpartition(".")
+        if ext and base:
+            name = f"{base} (2).{ext}"
+        else:
+            name = f"{name} (2)"
+        context.user_data[SELECTED_NAME] = name
+
+    await query.edit_message_text("Uploading...")
+
+    try:
+        link = drive.upload_file(pdf_bytes, name, folder_id)
+        path_str = _path_display(context.user_data[SELECTED_FOLDER_PATH], name)
+        await query.edit_message_text(f"Saved!\n\n{path_str}\n\n[Open in Drive]({link})", parse_mode="Markdown")
+    except Exception:
+        logger.exception("Upload failed")
+        await query.edit_message_text("Upload failed. Please try again.")
+
+    _cleanup_user_data(context)
+    return ConversationHandler.END
+
+
+async def handle_change_folder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """User tapped Change Folder — start browsing from root."""
+    query = update.callback_query
+    await query.answer()
+
+    root_id = config.get("root_folder_id")
+    children = drive.get_children(root_id)
+    context.user_data[BROWSE_STACK] = [(root_id, "Files")]
+
+    if not children:
+        await query.edit_message_text("No folders found.", reply_markup=_suggestion_keyboard())
+        return State.SUGGESTION
+
+    await query.edit_message_text(
+        "Select a folder:\n\nFiles /",
+        reply_markup=_folder_keyboard(children, show_select_here=False),
+    )
+    return State.BROWSE_FOLDER
+
+
+async def handle_new_folder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """User tapped New Folder."""
+    query = update.callback_query
+    await query.answer()
+    path_str = " > ".join(context.user_data.get(SELECTED_FOLDER_PATH, [])) or "Files"
+    await query.edit_message_text(
+        f"Type the new folder name (will be created inside {path_str}):"
+    )
+    return State.AWAIT_FOLDER_NAME
+
+
+async def handle_rename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """User tapped Rename."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Type the new file name:")
+    return State.AWAIT_FILE_NAME
+
+
+# ---------------------------------------------------------------------------
+# BROWSE_FOLDER state
+# ---------------------------------------------------------------------------
+
+async def handle_folder_browse(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    stack: list[tuple[str, str]] = context.user_data.get(BROWSE_STACK, [])
+
+    if data == "back":
+        if len(stack) > 1:
+            stack.pop()
+        parent_id, parent_name = stack[-1]
+        children = drive.get_children(parent_id)
+        breadcrumb = " > ".join(name for _, name in stack) + " /"
+        show_select = len(stack) > 1
+        await query.edit_message_text(
+            f"Select a folder:\n\n{breadcrumb}",
+            reply_markup=_folder_keyboard(children, show_select_here=show_select),
+        )
+        return State.BROWSE_FOLDER
+
+    if data == "select_here":
+        folder_id, folder_name = stack[-1]
+        path_names = [name for _, name in stack[1:]]  # skip "Files" root label
+        context.user_data[SELECTED_FOLDER_ID] = folder_id
+        context.user_data[SELECTED_FOLDER_PATH] = path_names
+
+        # Re-suggest name for new folder
+        try:
+            siblings = drive.list_files(folder_id)
+            doc_summary = context.user_data.get(DOC_SUMMARY, "")
+            if doc_summary:
+                new_name = await gemini.suggest_name(doc_summary, siblings)
+                context.user_data[SELECTED_NAME] = new_name
+        except Exception:
+            logger.exception("Name re-suggestion failed")
+
+        name = context.user_data[SELECTED_NAME]
+        display = _path_display(path_names, name)
+        await query.edit_message_text(
+            f"Updated:\n\n{display}",
+            reply_markup=_suggestion_keyboard(),
+        )
+        return State.SUGGESTION
+
+    if data.startswith("folder:"):
+        parts = data.split(":", 2)
+        folder_id = parts[1]
+        folder_name = parts[2] if len(parts) > 2 else "?"
+        stack.append((folder_id, folder_name))
+        context.user_data[BROWSE_STACK] = stack
+
+        children = drive.get_children(folder_id)
+        breadcrumb = " > ".join(name for _, name in stack) + " /"
+
+        if not children:
+            # Leaf folder — auto-select
+            path_names = [name for _, name in stack[1:]]
+            context.user_data[SELECTED_FOLDER_ID] = folder_id
+            context.user_data[SELECTED_FOLDER_PATH] = path_names
+
+            try:
+                siblings = drive.list_files(folder_id)
+                doc_summary = context.user_data.get(DOC_SUMMARY, "")
+                if doc_summary:
+                    new_name = await gemini.suggest_name(doc_summary, siblings)
+                    context.user_data[SELECTED_NAME] = new_name
+            except Exception:
+                logger.exception("Name re-suggestion failed")
+
+            name = context.user_data[SELECTED_NAME]
+            display = _path_display(path_names, name)
+            await query.edit_message_text(
+                f"Updated:\n\n{display}",
+                reply_markup=_suggestion_keyboard(),
+            )
+            return State.SUGGESTION
+
+        await query.edit_message_text(
+            f"Select a folder:\n\n{breadcrumb}",
+            reply_markup=_folder_keyboard(children),
+        )
+        return State.BROWSE_FOLDER
+
+    return State.BROWSE_FOLDER
+
+
+# ---------------------------------------------------------------------------
+# AWAIT_FOLDER_NAME state
+# ---------------------------------------------------------------------------
+
+async def handle_new_folder_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    folder_name = update.message.text.strip()
+    if not folder_name:
+        await update.message.reply_text("Folder name can't be empty. Try again:")
+        return State.AWAIT_FOLDER_NAME
+
+    parent_id = context.user_data[SELECTED_FOLDER_ID]
+    try:
+        new_id = drive.create_folder(folder_name, parent_id)
+    except Exception:
+        logger.exception("Folder creation failed")
+        await update.message.reply_text("Failed to create folder. Try again:")
+        return State.AWAIT_FOLDER_NAME
+
+    path = list(context.user_data.get(SELECTED_FOLDER_PATH, []))
+    path.append(folder_name)
+    context.user_data[SELECTED_FOLDER_ID] = new_id
+    context.user_data[SELECTED_FOLDER_PATH] = path
+
+    name = context.user_data[SELECTED_NAME]
+    display = _path_display(path, name)
+    await update.message.reply_text(
+        f"Folder created! Updated:\n\n{display}",
+        reply_markup=_suggestion_keyboard(),
+    )
+    return State.SUGGESTION
+
+
+# ---------------------------------------------------------------------------
+# AWAIT_FILE_NAME state
+# ---------------------------------------------------------------------------
+
+async def handle_file_rename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    new_name = update.message.text.strip()
+    if not new_name:
+        await update.message.reply_text("Name can't be empty. Try again:")
+        return State.AWAIT_FILE_NAME
+
+    context.user_data[SELECTED_NAME] = new_name
+    path = context.user_data.get(SELECTED_FOLDER_PATH, [])
+    display = _path_display(path, new_name)
+    await update.message.reply_text(
+        f"Updated:\n\n{display}",
+        reply_markup=_suggestion_keyboard(),
+    )
+    return State.SUGGESTION
+
+
+# ---------------------------------------------------------------------------
+# CONFIRM_OVERWRITE state
+# ---------------------------------------------------------------------------
+
+async def handle_overwrite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    name = context.user_data[SELECTED_NAME]
+    folder_id = context.user_data[SELECTED_FOLDER_ID]
+    pdf_bytes = context.user_data[PDF_BYTES]
+
+    if query.data == "overwrite_yes":
+        file_id = context.user_data.get(DUPLICATE_FILE_ID)
+        await query.edit_message_text("Overwriting...")
+        try:
+            link = drive.upload_file(pdf_bytes, name, folder_id, overwrite_id=file_id)
+            path_str = _path_display(context.user_data[SELECTED_FOLDER_PATH], name)
+            await query.edit_message_text(
+                f"Overwritten!\n\n{path_str}\n\n[Open in Drive]({link})",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            logger.exception("Overwrite failed")
+            await query.edit_message_text("Overwrite failed. Please try again.")
+    else:
+        base, _, ext = name.rpartition(".")
+        if ext and base:
+            new_name = f"{base} (2).{ext}"
+        else:
+            new_name = f"{name} (2)"
+        context.user_data[SELECTED_NAME] = new_name
+
+        await query.edit_message_text("Uploading as copy...")
+        try:
+            link = drive.upload_file(pdf_bytes, new_name, folder_id)
+            path_str = _path_display(context.user_data[SELECTED_FOLDER_PATH], new_name)
+            await query.edit_message_text(
+                f"Saved!\n\n{path_str}\n\n[Open in Drive]({link})",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            logger.exception("Upload failed")
+            await query.edit_message_text("Upload failed. Please try again.")
+
+    _cleanup_user_data(context)
+    return ConversationHandler.END
+
+
+# ---------------------------------------------------------------------------
+# Cancel / helpers
+# ---------------------------------------------------------------------------
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    _cleanup_user_data(context)
+    if update.message:
+        await update.message.reply_text("Cancelled.")
+    elif update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text("Cancelled.")
+    return ConversationHandler.END
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update):
+        await _reject(update)
+        return
+    await update.message.reply_text(
+        "Hi! Send me a PDF and I'll help you file it in Google Drive."
+    )
+
+
+def _cleanup_user_data(context: ContextTypes.DEFAULT_TYPE) -> None:
+    for key in (
+        PDF_BYTES, PDF_FILENAME, SUGGESTED_PATH, SUGGESTED_NAME,
+        SELECTED_FOLDER_ID, SELECTED_FOLDER_PATH, SELECTED_NAME,
+        BROWSE_STACK, CONFIDENCE, DOC_SUMMARY, DUPLICATE_FILE_ID,
+    ):
+        context.user_data.pop(key, None)
+
+
+# ---------------------------------------------------------------------------
+# Build the ConversationHandler
+# ---------------------------------------------------------------------------
+
+def build_conversation_handler() -> ConversationHandler:
+    return ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Document.PDF, handle_document),
+        ],
+        states={
+            State.SUGGESTION: [
+                CallbackQueryHandler(handle_save, pattern=r"^save$"),
+                CallbackQueryHandler(handle_change_folder, pattern=r"^change_folder$"),
+                CallbackQueryHandler(handle_new_folder, pattern=r"^new_folder$"),
+                CallbackQueryHandler(handle_rename, pattern=r"^rename$"),
+            ],
+            State.BROWSE_FOLDER: [
+                CallbackQueryHandler(handle_folder_browse),
+            ],
+            State.AWAIT_FOLDER_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_new_folder_name),
+            ],
+            State.AWAIT_FILE_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_file_rename),
+            ],
+            State.CONFIRM_OVERWRITE: [
+                CallbackQueryHandler(handle_overwrite),
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+        ],
+        allow_reentry=True,
+    )
