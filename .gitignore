@@ -1,9 +1,12 @@
 config.yaml
 credentials.json
+service-account.json
 token.json
+secrets/
 cleanup_token.json
 cleanup_log.json
 __pycache__/
 *.pyc
 .env
 .venv/
+.plans/

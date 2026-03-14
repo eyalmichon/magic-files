@@ -49,9 +49,21 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
     return _CONFIG
 
 
-def get(key: str) -> Any:
+def get(key: str, default: Any = _SENTINEL := object()) -> Any:
     """Shortcut to fetch a single top-level config value."""
     cfg = load_config()
     if key not in cfg:
+        if default is not _SENTINEL:
+            return default
         raise KeyError(f"Missing config key: '{key}'")
     return cfg[key]
+
+
+def set_and_save(key: str, value: Any) -> None:
+    """Update a config key in memory and persist to disk."""
+    cfg = load_config()
+    cfg[key] = value
+
+    path = Path(__file__).resolve().parent.parent / "config.yaml"
+    with open(path, "w") as f:
+        yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True, sort_keys=False)

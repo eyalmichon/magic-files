@@ -23,11 +23,18 @@ logger = logging.getLogger(__name__)
 # Auth — reject messages from unknown users
 # ---------------------------------------------------------------------------
 
+def _is_first_run() -> bool:
+    allowed = config.get("allowed_user_ids", [])
+    return not allowed
+
+
 def _is_authorized(update: Update) -> bool:
     user = update.effective_user
     if not user:
         return False
-    allowed = config.get("allowed_user_ids")
+    allowed = config.get("allowed_user_ids", [])
+    if not allowed:
+        return True  # first-run: allow anyone (will register on /start)
     return user.id in allowed
 
 
@@ -52,6 +59,7 @@ class State(IntEnum):
     AWAIT_FILE_NAME = auto()
     AWAIT_NAME_INPUT = auto()
     CONFIRM_OVERWRITE = auto()
+    SETUP_PICK_ROOT = auto()
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +143,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     """Entry point — user sends a PDF."""
     if not _is_authorized(update):
         await _reject(update)
+        return ConversationHandler.END
+
+    if not config.get("root_folder_id", None):
+        await update.message.reply_text(
+            "Root folder not set yet. Run /setup first."
+        )
         return ConversationHandler.END
 
     doc = update.message.document
@@ -539,9 +553,92 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_authorized(update):
         await _reject(update)
         return
+
+    user = update.effective_user
+
+    if _is_first_run():
+        config.set_and_save("allowed_user_ids", [user.id])
+        logger.info("First-run: registered user %s (%s) as admin", user.id, user.full_name)
+        await update.message.reply_text(
+            f"Welcome! You've been registered as the admin (ID: {user.id}).\n\n"
+            "Let's set up your root Drive folder. Use /setup to pick one, "
+            "or send me a PDF to get started."
+        )
+        return
+
+    root = config.get("root_folder_id", None)
+    if not root:
+        await update.message.reply_text(
+            "Almost ready! Run /setup to pick your root Drive folder."
+        )
+        return
+
     await update.message.reply_text(
         "Hi! Send me a PDF and I'll help you file it in Google Drive."
     )
+
+
+async def setup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Start the root folder picker flow."""
+    if not _is_authorized(update):
+        await _reject(update)
+        return ConversationHandler.END
+
+    try:
+        service = drive.get_service()
+        resp = (
+            service.files()
+            .list(
+                q="'root' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
+                fields="files(id, name)",
+                orderBy="name",
+                pageSize=50,
+            )
+            .execute()
+        )
+        folders = resp.get("files", [])
+    except Exception:
+        logger.exception("Failed to list root folders")
+        await update.message.reply_text("Failed to access Drive. Check your credentials.")
+        return ConversationHandler.END
+
+    if not folders:
+        await update.message.reply_text("No folders found in your Drive root.")
+        return ConversationHandler.END
+
+    rows = []
+    for f in folders:
+        rows.append([InlineKeyboardButton(f"\U0001F4C2 {f['name']}", callback_data=f"setup_folder:{f['id']}:{f['name']}")])
+
+    await update.message.reply_text(
+        "Pick the root folder where all your documents are stored:",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+    return State.SETUP_PICK_ROOT
+
+
+async def handle_setup_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """User picked a root folder during setup."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if not data.startswith("setup_folder:"):
+        return State.SETUP_PICK_ROOT
+
+    parts = data.split(":", 2)
+    folder_id = parts[1]
+    folder_name = parts[2] if len(parts) > 2 else "?"
+
+    config.set_and_save("root_folder_id", folder_id)
+    drive.invalidate_cache()
+    logger.info("Setup: root folder set to %s (%s)", folder_name, folder_id)
+
+    await query.edit_message_text(
+        f"\U00002705 Root folder set to: {folder_name}\n\n"
+        "You're all set! Send me a PDF to get started."
+    )
+    return ConversationHandler.END
 
 
 def _cleanup_user_data(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -565,6 +662,22 @@ async def _timeout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 CONVERSATION_TIMEOUT = 600  # 10 minutes
+
+
+def build_setup_handler() -> ConversationHandler:
+    return ConversationHandler(
+        entry_points=[
+            CommandHandler("setup", setup_command),
+        ],
+        states={
+            State.SETUP_PICK_ROOT: [
+                CallbackQueryHandler(handle_setup_pick, pattern=r"^setup_folder:"),
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+        ],
+    )
 
 
 def build_conversation_handler() -> ConversationHandler:

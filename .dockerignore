@@ -1,0 +1,16 @@
+.venv/
+.git/
+.plans/
+.gitignore
+.dockerignore
+__pycache__/
+*.pyc
+scripts/
+config.yaml
+secrets/
+token.json
+credentials.json
+cleanup_token.json
+cleanup_log.json
+README.md
+Dockerfile

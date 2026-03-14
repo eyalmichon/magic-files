@@ -15,6 +15,7 @@ from typing import Any
 import google.auth
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
+from google.oauth2 import service_account
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaInMemoryUpload
@@ -41,11 +42,27 @@ _CACHE_TTL = 300  # 5 minutes
 
 
 # ---------------------------------------------------------------------------
-# Auth — tries gcloud ADC first, falls back to credentials.json OAuth flow
+# Auth — tries service account, then ADC, then OAuth flow
 # ---------------------------------------------------------------------------
 
-def _get_credentials() -> Credentials:
-    # 1) Try Application Default Credentials (gcloud auth application-default login)
+def _get_credentials():
+    base = Path(__file__).resolve().parent.parent
+    sa_path = base / "secrets" / "adc.json"
+    if not sa_path.exists():
+        sa_path = base / "service-account.json"
+
+    # 1) Service account key (preferred for headless/server deployment)
+    if sa_path.exists():
+        try:
+            creds = service_account.Credentials.from_service_account_file(
+                str(sa_path), scopes=SCOPES,
+            )
+            logger.info("Using service account credentials (%s)", sa_path.name)
+            return creds
+        except Exception:
+            pass
+
+    # 2) Application Default Credentials (gcloud auth application-default login)
     try:
         creds, _ = google.auth.default(scopes=SCOPES)
         creds.refresh(Request())
@@ -54,9 +71,9 @@ def _get_credentials() -> Credentials:
     except Exception:
         pass
 
-    # 2) Fall back to saved token / OAuth flow with credentials.json
-    token_path = Path(__file__).resolve().parent.parent / "token.json"
-    creds_path = Path(__file__).resolve().parent.parent / "credentials.json"
+    # 3) Fall back to saved token / OAuth flow with credentials.json
+    token_path = base / "token.json"
+    creds_path = base / "credentials.json"
 
     creds = None
     if token_path.exists():
@@ -68,9 +85,10 @@ def _get_credentials() -> Credentials:
         else:
             if not creds_path.exists():
                 raise FileNotFoundError(
-                    "No credentials found. Either run:\n"
-                    "  gcloud auth application-default login --scopes=...\n"
-                    f"or place OAuth credentials at {creds_path}"
+                    "No credentials found. Options:\n"
+                    "  1. Place a service account key at secrets/adc.json\n"
+                    "  2. Run: gcloud auth application-default login\n"
+                    f"  3. Place OAuth credentials at {creds_path}"
                 )
             flow = InstalledAppFlow.from_client_secrets_file(str(creds_path), SCOPES)
             creds = flow.run_local_server(port=0)

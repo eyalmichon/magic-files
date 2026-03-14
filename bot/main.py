@@ -8,7 +8,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler
 
 from bot import config
-from bot.handlers import build_conversation_handler, start
+from bot.handlers import build_conversation_handler, build_setup_handler, start
 
 logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
@@ -32,6 +32,7 @@ def main() -> None:
     app = Application.builder().token(token).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(build_setup_handler())
     app.add_handler(build_conversation_handler())
 
     logger.info("Bot is running. Press Ctrl+C to stop.")
