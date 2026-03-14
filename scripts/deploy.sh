@@ -120,7 +120,7 @@ chmod 666 "$STATE_PATH"
 
 VOLUMES="      - ${DEPLOY_DIR}/.env:/app/.env:ro"
 [[ -s "${DEPLOY_DIR}/token.json" ]] && VOLUMES="${VOLUMES}
-      - ${DEPLOY_DIR}/token.json:/app/token.json:ro"
+      - ${DEPLOY_DIR}/token.json:/app/token.json"
 VOLUMES="${VOLUMES}
       - ${STATE_PATH}:/app/state.json"
 

@@ -15,9 +15,7 @@ class State(BaseModel):
     allowed_user_ids: list[int] = Field(default_factory=list)
 
     def save(self) -> None:
-        tmp = _STATE_PATH.with_suffix(".tmp")
-        tmp.write_text(self.model_dump_json(indent=2))
-        tmp.replace(_STATE_PATH)
+        _STATE_PATH.write_text(self.model_dump_json(indent=2))
 
 
 @cache
