@@ -29,8 +29,10 @@ APP_PROPERTY_KEY = "uploaded_by"
 APP_PROPERTY_VAL = "magic-files"
 
 _FOLDER_MIME = "application/vnd.google-apps.folder"
+_MAX_TREE_DEPTH = 5
 
 _service = None
+_credentials = None
 
 # In-memory cache: {parent_id: (timestamp, tree)}
 _folder_cache: dict[str, tuple[float, list[dict]]] = {}
@@ -47,7 +49,6 @@ def _get_credentials():
     if not sa_path.exists():
         sa_path = base / "service-account.json"
 
-    # 1) Service account key (preferred for headless/server deployment)
     if sa_path.exists():
         try:
             creds = service_account.Credentials.from_service_account_file(
@@ -56,23 +57,24 @@ def _get_credentials():
             logger.info("Using service account credentials (%s)", sa_path.name)
             return creds
         except Exception:
-            pass
+            logger.debug("Service account auth failed", exc_info=True)
 
-    # 2) Application Default Credentials (gcloud auth application-default login)
     try:
         creds, _ = google.auth.default(scopes=SCOPES)
         creds.refresh(Request())
         logger.info("Using Application Default Credentials (gcloud)")
         return creds
     except Exception:
-        pass
+        logger.debug("ADC auth failed", exc_info=True)
 
-    # 3) Fall back to saved token / interactive OAuth flow
     token_path = base / "token.json"
 
     creds = None
     if token_path.exists():
-        creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+        try:
+            creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+        except Exception:
+            logger.debug("Failed to load saved token", exc_info=True)
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
@@ -86,9 +88,21 @@ def _get_credentials():
 
 
 def get_service():
-    global _service
+    global _service, _credentials
+    if _service is not None and _credentials is not None:
+        if hasattr(_credentials, "expired") and _credentials.expired:
+            if hasattr(_credentials, "refresh_token") and _credentials.refresh_token:
+                try:
+                    _credentials.refresh(Request())
+                    return _service
+                except Exception:
+                    logger.debug("Credential refresh failed, rebuilding service", exc_info=True)
+            _service = None
+            _credentials = None
+
     if _service is None:
-        _service = build("drive", "v3", credentials=_get_credentials())
+        _credentials = _get_credentials()
+        _service = build("drive", "v3", credentials=_credentials)
     return _service
 
 
@@ -120,7 +134,12 @@ def _list_children_folders(parent_id: str) -> list[dict]:
     return results
 
 
-def list_folder_tree(parent_id: str | None = None, *, force: bool = False) -> list[dict]:
+def list_folder_tree(
+    parent_id: str | None = None,
+    *,
+    force: bool = False,
+    max_depth: int = _MAX_TREE_DEPTH,
+) -> list[dict]:
     """Recursively list the folder tree under *parent_id*.
 
     Returns a list of dicts:
@@ -135,10 +154,13 @@ def list_folder_tree(parent_id: str | None = None, *, force: bool = False) -> li
         if now - ts < _CACHE_TTL:
             return cached
 
+    if max_depth <= 0:
+        return []
+
     children = _list_children_folders(parent_id)
     tree = []
     for child in children:
-        subtree = list_folder_tree(child["id"], force=force)
+        subtree = list_folder_tree(child["id"], force=force, max_depth=max_depth - 1)
         tree.append({
             "id": child["id"],
             "name": child["name"],
@@ -150,9 +172,19 @@ def list_folder_tree(parent_id: str | None = None, *, force: bool = False) -> li
 
 
 def get_children(parent_id: str | None = None) -> list[dict]:
-    """Return immediate child folders (id + name) of *parent_id*."""
+    """Return immediate child folders (id + name) of *parent_id*.
+
+    Uses the tree cache when available to avoid redundant API calls.
+    """
     if parent_id is None:
         parent_id = get_state().root_folder_id
+
+    now = time.time()
+    if parent_id in _folder_cache:
+        ts, cached = _folder_cache[parent_id]
+        if now - ts < _CACHE_TTL:
+            return [{"id": n["id"], "name": n["name"]} for n in cached]
+
     return _list_children_folders(parent_id)
 
 

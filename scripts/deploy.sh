@@ -69,11 +69,11 @@ else
   [[ -z "$G_CLIENT_SECRET" ]] && err "Google Client Secret is required."
 
   cat > "$ENV_FILE" << EOF
-TELEGRAM_BOT_TOKEN=${TG_TOKEN}
-GEMINI_API_KEY=${GEMINI_KEY}
-ADMIN_TELEGRAM_ID=${ADMIN_ID}
-GOOGLE_CLIENT_ID=${G_CLIENT_ID}
-GOOGLE_CLIENT_SECRET=${G_CLIENT_SECRET}
+TELEGRAM_BOT_TOKEN="${TG_TOKEN}"
+GEMINI_API_KEY="${GEMINI_KEY}"
+ADMIN_TELEGRAM_ID="${ADMIN_ID}"
+GOOGLE_CLIENT_ID="${G_CLIENT_ID}"
+GOOGLE_CLIENT_SECRET="${G_CLIENT_SECRET}"
 EOF
   msg ".env created"
 fi
@@ -113,11 +113,16 @@ COMPOSE_FILE="${SERVICES_DIR}/docker-compose.yml"
 
 header "Registering service"
 
+STATE_PATH="${DEPLOY_DIR}/state.json"
+[[ -d "$STATE_PATH" ]] && rm -rf "$STATE_PATH"
+[[ -s "$STATE_PATH" ]] || echo '{}' > "$STATE_PATH"
+chmod 666 "$STATE_PATH"
+
 VOLUMES="      - ${DEPLOY_DIR}/.env:/app/.env:ro"
-[[ -f "${DEPLOY_DIR}/token.json" ]] && VOLUMES="${VOLUMES}
+[[ -s "${DEPLOY_DIR}/token.json" ]] && VOLUMES="${VOLUMES}
       - ${DEPLOY_DIR}/token.json:/app/token.json:ro"
 VOLUMES="${VOLUMES}
-      - ${DEPLOY_DIR}/state.json:/app/state.json"
+      - ${STATE_PATH}:/app/state.json"
 
 cat > "$COMPOSE_FILE" << EOF
 services:

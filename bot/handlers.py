@@ -1,6 +1,7 @@
 """Telegram bot handlers — PDF receive, folder navigation, save flow."""
 from __future__ import annotations
 
+import html
 import logging
 from enum import IntEnum, auto
 
@@ -19,6 +20,8 @@ from bot.config import get_settings
 from bot.state import get_state
 
 logger = logging.getLogger(__name__)
+
+BROWSE_FOLDERS = "browse_folders"
 
 
 # ---------------------------------------------------------------------------
@@ -43,7 +46,8 @@ def _is_authorized(update: Update) -> bool:
 
 
 async def _reject(update: Update) -> None:
-    uid = update.effective_user.id
+    user = update.effective_user
+    uid = user.id if user else "unknown"
     logger.warning("Unauthorized access attempt from user ID %s", uid)
     text = "This bot is private."
     if update.message:
@@ -98,10 +102,17 @@ def _suggestion_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-def _folder_keyboard(children: list[dict], show_select_here: bool = True) -> InlineKeyboardMarkup:
+def _folder_keyboard(
+    children: list[dict],
+    context: ContextTypes.DEFAULT_TYPE,
+    show_select_here: bool = True,
+) -> InlineKeyboardMarkup:
+    context.user_data[BROWSE_FOLDERS] = children
     rows: list[list[InlineKeyboardButton]] = []
-    for child in children:
-        rows.append([InlineKeyboardButton(child["name"], callback_data=f"folder:{child['id']}:{child['name']}")])
+    for i, child in enumerate(children):
+        rows.append([InlineKeyboardButton(
+            child["name"], callback_data=f"f:{i}",
+        )])
 
     bottom_row: list[InlineKeyboardButton] = []
     if show_select_here:
@@ -123,7 +134,7 @@ def _overwrite_keyboard() -> InlineKeyboardMarkup:
 def _path_display(path: list[str], name: str) -> str:
     """Render folder path + file name as a vertical breadcrumb.
 
-    Uses Unicode LTR marks (\u200E) to force left-to-right rendering on each
+    Uses Unicode LTR marks (\\u200E) to force left-to-right rendering on each
     line, preventing Telegram's bidi algorithm from reordering mixed
     Hebrew/English content.
     """
@@ -139,6 +150,20 @@ def _path_display(path: list[str], name: str) -> str:
     return "\n".join(lines)
 
 
+def _unique_name(name: str, folder_id: str) -> str:
+    """Append an incrementing suffix until no collision in *folder_id*."""
+    base, _, ext = name.rpartition(".")
+    if not (ext and base):
+        base, ext = name, ""
+
+    for n in range(2, 100):
+        candidate = f"{base} ({n}).{ext}" if ext else f"{base} ({n})"
+        exists, _, _ = drive.check_duplicate(candidate, folder_id)
+        if not exists:
+            return candidate
+    return f"{base} (copy).{ext}" if ext else f"{base} (copy)"
+
+
 # ---------------------------------------------------------------------------
 # Entry: receive PDF
 # ---------------------------------------------------------------------------
@@ -148,6 +173,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not _is_authorized(update):
         await _reject(update)
         return ConversationHandler.END
+
+    _cleanup_user_data(context)
 
     if not get_state().root_folder_id:
         await update.message.reply_text(
@@ -251,20 +278,16 @@ async def handle_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
     if exists and is_ours:
         context.user_data[DUPLICATE_FILE_ID] = file_id
+        safe_name = html.escape(name)
         await query.edit_message_text(
-            f"A file named **{name}** already exists (uploaded by this bot).\n\nOverwrite it?",
+            f"A file named <b>{safe_name}</b> already exists (uploaded by this bot).\n\nOverwrite it?",
             reply_markup=_overwrite_keyboard(),
-            parse_mode="Markdown",
+            parse_mode="HTML",
         )
         return State.CONFIRM_OVERWRITE
 
     if exists:
-        # Not ours — append suffix
-        base, _, ext = name.rpartition(".")
-        if ext and base:
-            name = f"{base} (2).{ext}"
-        else:
-            name = f"{name} (2)"
+        name = _unique_name(name, folder_id)
         context.user_data[SELECTED_NAME] = name
 
     await query.edit_message_text("Uploading...")
@@ -272,7 +295,11 @@ async def handle_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     try:
         link = drive.upload_file(pdf_bytes, name, folder_id)
         path_str = _path_display(context.user_data[SELECTED_FOLDER_PATH], name)
-        await query.edit_message_text(f"Saved!\n\n{path_str}\n\n[Open in Drive]({link})", parse_mode="Markdown")
+        safe_link = html.escape(link)
+        await query.edit_message_text(
+            f"Saved!\n\n{path_str}\n\n<a href=\"{safe_link}\">Open in Drive</a>",
+            parse_mode="HTML",
+        )
     except Exception:
         logger.exception("Upload failed")
         await query.edit_message_text("Upload failed. Please try again.")
@@ -284,6 +311,9 @@ async def handle_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 async def handle_change_folder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """User tapped Change Folder — start browsing from root."""
     query = update.callback_query
+    if not _is_authorized(update):
+        await query.answer("Unauthorized.", show_alert=True)
+        return ConversationHandler.END
     await query.answer()
 
     root_id = get_state().root_folder_id
@@ -296,7 +326,7 @@ async def handle_change_folder(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await query.edit_message_text(
         "Select a folder:\n\nFiles /",
-        reply_markup=_folder_keyboard(children, show_select_here=False),
+        reply_markup=_folder_keyboard(children, context, show_select_here=False),
     )
     return State.BROWSE_FOLDER
 
@@ -304,6 +334,9 @@ async def handle_change_folder(update: Update, context: ContextTypes.DEFAULT_TYP
 async def handle_new_folder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """User tapped New Folder."""
     query = update.callback_query
+    if not _is_authorized(update):
+        await query.answer("Unauthorized.", show_alert=True)
+        return ConversationHandler.END
     await query.answer()
     path_parts = context.user_data.get(SELECTED_FOLDER_PATH, [])
     path_str = "\n".join(f"\u200E{'\u2003' * i}\U0001F4C2 {p}" for i, p in enumerate(path_parts)) if path_parts else "\u200E\U0001F4C2 Files"
@@ -316,6 +349,9 @@ async def handle_new_folder(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def handle_rename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """User tapped Rename."""
     query = update.callback_query
+    if not _is_authorized(update):
+        await query.answer("Unauthorized.", show_alert=True)
+        return ConversationHandler.END
     await query.answer()
     await query.edit_message_text("Type the new file name:")
     return State.AWAIT_FILE_NAME
@@ -383,6 +419,9 @@ async def _re_suggest_and_reply(
 
 async def handle_folder_browse(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
+    if not _is_authorized(update):
+        await query.answer("Unauthorized.", show_alert=True)
+        return ConversationHandler.END
     await query.answer()
     data = query.data
 
@@ -397,7 +436,7 @@ async def handle_folder_browse(update: Update, context: ContextTypes.DEFAULT_TYP
         show_select = len(stack) > 1
         await query.edit_message_text(
             f"Select a folder:\n\n{breadcrumb}",
-            reply_markup=_folder_keyboard(children, show_select_here=show_select),
+            reply_markup=_folder_keyboard(children, context, show_select_here=show_select),
         )
         return State.BROWSE_FOLDER
 
@@ -409,10 +448,14 @@ async def handle_folder_browse(update: Update, context: ContextTypes.DEFAULT_TYP
 
         return await _re_suggest_and_reply(query, context, folder_id, path_names)
 
-    if data.startswith("folder:"):
-        parts = data.split(":", 2)
-        folder_id = parts[1]
-        folder_name = parts[2] if len(parts) > 2 else "?"
+    if data.startswith("f:"):
+        idx = int(data.split(":")[1])
+        folders = context.user_data.get(BROWSE_FOLDERS, [])
+        if idx >= len(folders):
+            return State.BROWSE_FOLDER
+        folder_id = folders[idx]["id"]
+        folder_name = folders[idx]["name"]
+
         stack.append((folder_id, folder_name))
         context.user_data[BROWSE_STACK] = stack
 
@@ -428,7 +471,7 @@ async def handle_folder_browse(update: Update, context: ContextTypes.DEFAULT_TYP
 
         await query.edit_message_text(
             f"Select a folder:\n\n{breadcrumb}",
-            reply_markup=_folder_keyboard(children),
+            reply_markup=_folder_keyboard(children, context),
         )
         return State.BROWSE_FOLDER
 
@@ -508,28 +551,26 @@ async def handle_overwrite(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         try:
             link = drive.upload_file(pdf_bytes, name, folder_id, overwrite_id=file_id)
             path_str = _path_display(context.user_data[SELECTED_FOLDER_PATH], name)
+            safe_link = html.escape(link)
             await query.edit_message_text(
-                f"Overwritten!\n\n{path_str}\n\n[Open in Drive]({link})",
-                parse_mode="Markdown",
+                f"Overwritten!\n\n{path_str}\n\n<a href=\"{safe_link}\">Open in Drive</a>",
+                parse_mode="HTML",
             )
         except Exception:
             logger.exception("Overwrite failed")
             await query.edit_message_text("Overwrite failed. Please try again.")
     else:
-        base, _, ext = name.rpartition(".")
-        if ext and base:
-            new_name = f"{base} (2).{ext}"
-        else:
-            new_name = f"{name} (2)"
+        new_name = _unique_name(name, folder_id)
         context.user_data[SELECTED_NAME] = new_name
 
         await query.edit_message_text("Uploading as copy...")
         try:
             link = drive.upload_file(pdf_bytes, new_name, folder_id)
             path_str = _path_display(context.user_data[SELECTED_FOLDER_PATH], new_name)
+            safe_link = html.escape(link)
             await query.edit_message_text(
-                f"Saved!\n\n{path_str}\n\n[Open in Drive]({link})",
-                parse_mode="Markdown",
+                f"Saved!\n\n{path_str}\n\n<a href=\"{safe_link}\">Open in Drive</a>",
+                parse_mode="HTML",
             )
         except Exception:
             logger.exception("Upload failed")
@@ -651,8 +692,8 @@ def _cleanup_user_data(context: ContextTypes.DEFAULT_TYPE) -> None:
     for key in (
         PDF_BYTES, PDF_FILENAME, SUGGESTED_PATH, SUGGESTED_NAME,
         SELECTED_FOLDER_ID, SELECTED_FOLDER_PATH, SELECTED_NAME,
-        BROWSE_STACK, CONFIDENCE, DOC_SUMMARY, NAME_TEMPLATE,
-        DUPLICATE_FILE_ID,
+        BROWSE_STACK, BROWSE_FOLDERS, CONFIDENCE, DOC_SUMMARY,
+        NAME_TEMPLATE, DUPLICATE_FILE_ID,
     ):
         context.user_data.pop(key, None)
 
@@ -665,8 +706,6 @@ async def _timeout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Clean up user data when conversation times out."""
     _cleanup_user_data(context)
     return ConversationHandler.END
-
-
 
 
 def build_setup_handler() -> ConversationHandler:
@@ -711,6 +750,9 @@ def build_conversation_handler() -> ConversationHandler:
             ],
             State.CONFIRM_OVERWRITE: [
                 CallbackQueryHandler(handle_overwrite),
+            ],
+            ConversationHandler.TIMEOUT: [
+                MessageHandler(filters.ALL, _timeout),
             ],
         },
         fallbacks=[

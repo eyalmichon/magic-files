@@ -90,48 +90,11 @@ def _model() -> str:
     return get_settings().gemini_model
 
 
-async def analyze_folder(pdf_bytes: bytes, filename: str) -> dict[str, Any]:
-    """Step 1: determine target folder path and confidence.
-
-    Returns {"path": [...], "confidence": "high"|"low"}.
-    """
-    client = _get_client()
-
-    tree = list_folder_tree()
-    tree_text = folder_tree_to_text(tree)
-
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-        tmp.write(pdf_bytes)
-        tmp_path = tmp.name
-
-    try:
-        uploaded = client.files.upload(file=tmp_path)
-
-        response = client.models.generate_content(
-            model=_model(),
-            contents=[
-                uploaded,
-                f"Here is the folder tree:\n{tree_text}\n\n"
-                f"Original file name: {filename}\n\n"
-                "Analyze this document and pick the best folder path.",
-            ],
-            config=types.GenerateContentConfig(
-                system_instruction=FOLDER_SYSTEM_PROMPT,
-                response_mime_type="application/json",
-                temperature=0.1,
-            ),
-        )
-
-        result = json.loads(response.text)
-        logger.info("Gemini folder suggestion: %s", result)
-        return result
-
-    finally:
-        Path(tmp_path).unlink(missing_ok=True)
-        try:
-            client.files.delete(name=uploaded.name)
-        except Exception:
-            pass
+def _parse_response(response: types.GenerateContentResponse) -> Any:
+    """Parse a Gemini JSON response, raising on empty/blocked results."""
+    if not response.text:
+        raise ValueError("Gemini returned an empty response (possibly blocked by safety filter)")
+    return json.loads(response.text)
 
 
 async def suggest_name(
@@ -149,7 +112,7 @@ async def suggest_name(
 
     siblings_text = "\n".join(f"- {n}" for n in sibling_names) if sibling_names else "(empty folder)"
 
-    response = client.models.generate_content(
+    response = await client.aio.models.generate_content(
         model=_model(),
         contents=[
             f"Document summary: {doc_summary}\n\n"
@@ -167,7 +130,7 @@ async def suggest_name(
         ),
     )
 
-    result = json.loads(response.text)
+    result = _parse_response(response)
     logger.debug("Gemini name suggestion: %s", result)
     return {
         "name": result.get("name"),
@@ -195,10 +158,10 @@ async def analyze_pdf(pdf_bytes: bytes, filename: str) -> dict[str, Any]:
         tmp.write(pdf_bytes)
         tmp_path = tmp.name
 
+    uploaded = None
     try:
-        uploaded = client.files.upload(file=tmp_path)
+        uploaded = await client.aio.files.upload(file=tmp_path)
 
-        # Step 1 + summary in one call to save quota
         step1_prompt = (
             f"Here is the folder tree:\n{tree_text}\n\n"
             f"Original file name: {filename}\n\n"
@@ -210,7 +173,7 @@ async def analyze_pdf(pdf_bytes: bytes, filename: str) -> dict[str, Any]:
             "Return ONLY valid JSON."
         )
 
-        response = client.models.generate_content(
+        response = await client.aio.models.generate_content(
             model=_model(),
             contents=[uploaded, step1_prompt],
             config=types.GenerateContentConfig(
@@ -220,17 +183,17 @@ async def analyze_pdf(pdf_bytes: bytes, filename: str) -> dict[str, Any]:
             ),
         )
 
-        step1 = json.loads(response.text)
+        step1 = _parse_response(response)
         logger.debug("Gemini step 1: %s", step1)
 
     finally:
         Path(tmp_path).unlink(missing_ok=True)
-        try:
-            client.files.delete(name=uploaded.name)
-        except Exception:
-            pass
+        if uploaded:
+            try:
+                await client.aio.files.delete(name=uploaded.name)
+            except Exception:
+                pass
 
-    # Resolve folder and fetch siblings for step 2
     folder_id = resolve_path(step1.get("path", []), tree)
 
     sibling_names: list[str] = []
