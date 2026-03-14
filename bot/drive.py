@@ -26,7 +26,7 @@ from bot.state import get_state
 logger = logging.getLogger(__name__)
 
 APP_PROPERTY_KEY = "uploaded_by"
-APP_PROPERTY_VAL = "drive-bot"
+APP_PROPERTY_VAL = "magic-files"
 
 _FOLDER_MIME = "application/vnd.google-apps.folder"
 

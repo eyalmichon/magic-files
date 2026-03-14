@@ -3,11 +3,11 @@
 # MagicFiles Bot — deploy to Docker host
 #
 # Run from the Docker host LXC console:
-#   bash -c "$(wget -qLO - https://raw.githubusercontent.com/eyalmichon/drive-bot/main/scripts/deploy.sh)"
+#   bash -c "$(wget -qLO - https://raw.githubusercontent.com/eyalmichon/magic-files/main/scripts/deploy.sh)"
 # ──────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
-REPO="https://github.com/eyalmichon/drive-bot.git"
+REPO="https://github.com/eyalmichon/magic-files.git"
 SERVICE_NAME="magic-files"
 SERVICES_DIR="/opt/services"
 DEPLOY_DIR="${SERVICES_DIR}/${SERVICE_NAME}"

@@ -1,4 +1,4 @@
-# Drive Bot
+# Magic Files
 
 A Telegram bot that receives scanned PDFs, uses Gemini AI to suggest the right folder and file name, and saves them to Google Drive.
 
@@ -7,82 +7,63 @@ A Telegram bot that receives scanned PDFs, uses Gemini AI to suggest the right f
 - Send a PDF to the bot on Telegram
 - Gemini analyzes the document and suggests a folder path + file name
 - File names match the existing naming pattern in each folder
+- Asks for missing info (e.g. billing period) instead of guessing
 - Drill-down folder navigation if you want to change the suggestion
 - Create new folders on the fly
 - Duplicate detection with overwrite confirmation (bot-created files only)
 - Read-only + create-only Drive permissions (cannot modify your existing files)
+- Mixed Hebrew/English text displays correctly in Telegram
 
-## Prerequisites
+## Quick Deploy (Docker host)
 
-- Python 3.11+
-- A Google Cloud project with Drive API and Generative Language API enabled
-- A Telegram bot token from [@BotFather](https://t.me/BotFather)
-
-## Setup
-
-### 1. Create a Telegram bot
-
-1. Open Telegram and talk to [@BotFather](https://t.me/BotFather)
-2. Send `/newbot`, pick a name and username
-3. Copy the bot token
-
-### 2. Google Cloud project
-
-1. Go to [Google Cloud Console](https://console.cloud.google.com)
-2. Create a new project (or use an existing one)
-3. Enable these APIs:
-   - [Google Drive API](https://console.cloud.google.com/apis/library/drive.googleapis.com)
-   - [Generative Language API](https://console.cloud.google.com/apis/library/generativelanguage.googleapis.com)
-
-### 3. OAuth credentials (for Drive access)
-
-1. Go to **APIs & Services > Credentials**
-2. Click **Create Credentials > OAuth client ID**
-3. Choose **Desktop app** as the application type
-4. Download the JSON file and save it as `credentials.json` in the project root
-
-### 4. Gemini API key
-
-1. Go to [Google AI Studio](https://aistudio.google.com/apikey)
-2. Create an API key
-3. Copy it
-
-### 5. Configure
-
-Set the environment variables:
+From the Docker host LXC console:
 
 ```bash
-export TELEGRAM_BOT_TOKEN="your-telegram-bot-token"
-export GEMINI_API_KEY="your-gemini-api-key"
+bash -c "$(wget -qLO - https://raw.githubusercontent.com/eyalmichon/magic-files/main/scripts/deploy.sh)"
 ```
 
-The `config.yaml` file is pre-configured with the root Drive folder ID. Edit it if your folder structure is different.
+The script will prompt for your Telegram bot token, Gemini API key, and admin Telegram ID, then walk you through Google Drive authorization.
 
-### 6. Install dependencies
+## Manual Setup
+
+### Prerequisites
+
+- Python 3.11+
+- [uv](https://docs.astral.sh/uv/) package manager
+- A Telegram bot token from [@BotFather](https://t.me/BotFather)
+- A Gemini API key from [Google AI Studio](https://aistudio.google.com/apikey)
+
+### 1. Install dependencies
 
 ```bash
 uv sync
 ```
 
-This creates a `.venv/` in the project root and installs everything. No manual venv activation needed.
+### 2. Configure
 
-### 7. Run the cleanup script (optional, one-time)
+Create a `.env` file in the project root:
 
-This scans your Drive and proposes file renames (adding `.pdf` extensions, standardizing bill names, etc.):
-
-```bash
-uv run python -m scripts.cleanup
+```
+TELEGRAM_BOT_TOKEN=your-telegram-bot-token
+GEMINI_API_KEY=your-gemini-api-key
+ADMIN_TELEGRAM_ID=your-telegram-user-id
 ```
 
-Use `--dry-run` to preview changes without renaming.
+### 3. Authorize Google Drive
 
-### 8. Start the bot
+```bash
+uv run python -m scripts.auth_drive
+```
+
+Choose **Auto** if you have a browser on the same machine, or **Manual** for remote/headless environments. The refresh token is saved to `token.json`.
+
+### 4. Start the bot
 
 ```bash
 uv run python -m bot.main
 ```
 
-On first run, a browser window will open for Google Drive OAuth consent. After that, the refresh token is cached in `token.json`.
+Send `/start` to the bot, then `/setup` to pick your root Drive folder.
 
 ## How it works
 
@@ -91,8 +72,9 @@ On first run, a browser window will open for Google Drive OAuth consent. After t
 3. Gemini suggests a folder path based on your Drive structure
 4. The bot checks existing file names in the target folder
 5. Gemini suggests a file name matching the existing pattern
-6. You confirm, change the folder, rename, or create a new folder
-7. The bot uploads the PDF to Google Drive and returns a link
+6. If info is missing (e.g. billing period), it asks you instead of guessing
+7. You confirm, change the folder, rename, or create a new folder
+8. The bot uploads the PDF to Google Drive and returns a link
 
 ## Safety
 
@@ -100,21 +82,26 @@ On first run, a browser window will open for Google Drive OAuth consent. After t
 - The bot **cannot** delete, rename, move, or modify your existing files
 - Duplicate files are detected — overwrites only apply to files the bot itself created
 - Every upload is tagged with `appProperties` so the bot can identify its own files
+- Only users listed in `state.json` (or matching `ADMIN_TELEGRAM_ID`) can use the bot
 
 ## Project structure
 
 ```
-drive-bot/
+magic-files/
   bot/
     main.py         Entry point
     handlers.py     Telegram message/callback handlers
     drive.py        Google Drive API (list, upload, create folder)
     gemini.py       Gemini PDF analysis (folder + name suggestion)
-    config.py       YAML config loader with env-var support
+    config.py       Settings from .env via pydantic-settings
+    state.py        Runtime state (root folder, allowed users)
+    oauth.py        OAuth client config and scopes
   scripts/
-    cleanup.py      One-time Drive file rename tool
-  config.yaml       Bot configuration
-  pyproject.toml    Project config & dependencies
-  credentials.json  OAuth credentials (not committed)
+    auth_drive.py   Google Drive authorization (auto + manual modes)
+    deploy.sh       One-liner deploy script for Docker hosts
+  .env              Secrets (not committed)
+  state.json        Runtime state (not committed)
   token.json        Cached OAuth token (not committed)
+  pyproject.toml    Project config & dependencies
+  Dockerfile        Container image definition
 ```

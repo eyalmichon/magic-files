@@ -1,5 +1,5 @@
 [project]
-name = "drive-bot"
+name = "magic-files"
 version = "0.1.0"
 description = "Telegram bot that files scanned PDFs into Google Drive with AI-powered folder and name suggestions."
 requires-python = ">=3.11"
