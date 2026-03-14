@@ -81,7 +81,7 @@ fi
 # ── Google Drive authorization ────────────────────────────────────────────────
 TOKEN_PATH="${DEPLOY_DIR}/token.json"
 
-if [[ -f "$TOKEN_PATH" ]]; then
+if [[ -s "$TOKEN_PATH" ]]; then
   msg "Google Drive already authorized"
 else
   header "Google Drive Authorization"
@@ -97,8 +97,10 @@ else
 
   info "Starting authorization flow..."
   touch "$TOKEN_PATH"
+  chmod 666 "$TOKEN_PATH"
   docker run --rm -it \
     -p 8080:8080 \
+    -v "${ENV_FILE}:/app/.env:ro" \
     -v "${TOKEN_PATH}:/app/token.json" \
     "${SERVICE_NAME}" \
     uv run python -m scripts.auth_drive /app/token.json
@@ -106,65 +108,27 @@ else
   [[ -s "$TOKEN_PATH" ]] && msg "Drive authorized" || err "Authorization failed"
 fi
 
-# ── Register in docker-compose.yml ───────────────────────────────────────────
+# ── Generate docker-compose.yml ──────────────────────────────────────────────
 COMPOSE_FILE="${SERVICES_DIR}/docker-compose.yml"
 
-if [[ ! -f "$COMPOSE_FILE" ]]; then
-  cat > "$COMPOSE_FILE" << 'YAML'
-services: {}
-YAML
-fi
-
 header "Registering service"
-python3 - "$COMPOSE_FILE" "$SERVICE_NAME" "$DEPLOY_DIR" << 'PYEOF'
-import sys, subprocess
-from pathlib import Path
 
-compose_path, service_name, build_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+VOLUMES="      - ${DEPLOY_DIR}/.env:/app/.env:ro"
+[[ -f "${DEPLOY_DIR}/token.json" ]] && VOLUMES="${VOLUMES}
+      - ${DEPLOY_DIR}/token.json:/app/token.json:ro"
+VOLUMES="${VOLUMES}
+      - ${DEPLOY_DIR}/state.json:/app/state.json"
 
-try:
-    import yaml
-except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "pyyaml"])
-    import yaml
-
-compose_file = Path(compose_path)
-data = {}
-if compose_file.exists():
-    with open(compose_file) as f:
-        data = yaml.safe_load(f) or {}
-
-if "services" not in data or data["services"] is None:
-    data["services"] = {}
-
-volumes = [f"{build_dir}/.env:/app/.env:ro"]
-token = Path(build_dir) / "token.json"
-state = Path(build_dir) / "state.json"
-secrets = Path(build_dir) / "secrets"
-if token.exists():
-    volumes.append(f"{build_dir}/token.json:/app/token.json:ro")
-if state.exists():
-    volumes.append(f"{build_dir}/state.json:/app/state.json")
-if secrets.exists():
-    volumes.append(f"{build_dir}/secrets:/app/secrets:ro")
-
-svc = {
-    "build": build_dir,
-    "container_name": service_name,
-    "restart": "unless-stopped",
-    "volumes": volumes,
-}
-if secrets.exists():
-    svc["environment"] = {
-        "GOOGLE_APPLICATION_CREDENTIALS": "/app/secrets/adc.json",
-    }
-
-data["services"][service_name] = svc
-
-with open(compose_file, "w") as f:
-    yaml.dump(data, f, default_flow_style=False, sort_keys=False)
-PYEOF
-msg "Added to ${COMPOSE_FILE}"
+cat > "$COMPOSE_FILE" << EOF
+services:
+  ${SERVICE_NAME}:
+    build: ${DEPLOY_DIR}
+    container_name: ${SERVICE_NAME}
+    restart: unless-stopped
+    volumes:
+${VOLUMES}
+EOF
+msg "Written ${COMPOSE_FILE}"
 
 # ── Build and start ──────────────────────────────────────────────────────────
 header "Building and starting"
