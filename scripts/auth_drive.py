@@ -14,7 +14,7 @@ from urllib.parse import parse_qs, urlparse
 
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-from bot.oauth import CLIENT_CONFIG, SCOPES
+from bot.oauth import SCOPES, get_client_config
 
 AUTH_PORT = 8080
 
@@ -74,7 +74,7 @@ def main() -> None:
 
     choice = input("  Enter 1 or 2 [2]: ").strip() or "2"
 
-    flow = InstalledAppFlow.from_client_config(CLIENT_CONFIG, SCOPES)
+    flow = InstalledAppFlow.from_client_config(get_client_config(), SCOPES)
 
     if choice == "1":
         _auto_flow(flow)

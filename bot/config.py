@@ -17,6 +17,8 @@ class Settings(BaseSettings):
 
     telegram_bot_token: str
     gemini_api_key: str
+    google_client_id: str
+    google_client_secret: str
     admin_telegram_id: int | None = None
     gemini_model: str = "gemini-2.5-flash"
     max_file_size_mb: int = 10

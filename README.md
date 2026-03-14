@@ -22,48 +22,52 @@ From the Docker host LXC console:
 bash -c "$(wget -qLO - https://raw.githubusercontent.com/eyalmichon/magic-files/main/scripts/deploy.sh)"
 ```
 
-The script will prompt for your Telegram bot token, Gemini API key, and admin Telegram ID, then walk you through Google Drive authorization.
+The script will walk you through everything below automatically.
 
 ## Manual Setup
 
-### Prerequisites
+### 1. Create a Telegram bot
 
-- Python 3.11+
-- [uv](https://docs.astral.sh/uv/) package manager
-- A Telegram bot token from [@BotFather](https://t.me/BotFather)
-- A Gemini API key from [Google AI Studio](https://aistudio.google.com/apikey)
+1. Open [@BotFather](https://t.me/BotFather) on Telegram
+2. Send `/newbot`, pick a name and username
+3. Copy the **bot token**
 
-### 1. Install dependencies
+### 2. Get a Gemini API key
 
-```bash
-uv sync
-```
+1. Go to [Google AI Studio](https://aistudio.google.com/apikey)
+2. Create an API key and copy it
 
-### 2. Configure
+### 3. Set up Google Drive access
+
+1. Go to [Google Cloud Console](https://console.cloud.google.com) and create a project (or use an existing one)
+2. Enable the [Google Drive API](https://console.cloud.google.com/apis/library/drive.googleapis.com)
+3. Go to [OAuth consent screen](https://console.cloud.google.com/apis/credentials/consent) → set to **External** → add your Google account as a **test user**
+4. Go to [Credentials](https://console.cloud.google.com/apis/credentials) → **Create Credentials** → **OAuth client ID** → choose **Desktop app**
+5. Copy the **Client ID** and **Client Secret**
+
+### 4. Configure
 
 Create a `.env` file in the project root:
 
 ```
-TELEGRAM_BOT_TOKEN=your-telegram-bot-token
-GEMINI_API_KEY=your-gemini-api-key
+TELEGRAM_BOT_TOKEN=your-bot-token
+GEMINI_API_KEY=your-gemini-key
 ADMIN_TELEGRAM_ID=your-telegram-user-id
+GOOGLE_CLIENT_ID=your-client-id.apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET=GOCSPX-your-client-secret
 ```
 
-### 3. Authorize Google Drive
+> To find your Telegram user ID, send `/start` to [@userinfobot](https://t.me/userinfobot).
+
+### 5. Install and run
 
 ```bash
-uv run python -m scripts.auth_drive
+uv sync
+uv run python -m scripts.auth_drive   # sign in to Google Drive
+uv run python -m bot.main             # start the bot
 ```
 
-Choose **Auto** if you have a browser on the same machine, or **Manual** for remote/headless environments. The refresh token is saved to `token.json`.
-
-### 4. Start the bot
-
-```bash
-uv run python -m bot.main
-```
-
-Send `/start` to the bot, then `/setup` to pick your root Drive folder.
+On first start, send `/start` to the bot, then `/setup` to pick your root Drive folder.
 
 ## How it works
 
@@ -95,7 +99,7 @@ magic-files/
     gemini.py       Gemini PDF analysis (folder + name suggestion)
     config.py       Settings from .env via pydantic-settings
     state.py        Runtime state (root folder, allowed users)
-    oauth.py        OAuth client config and scopes
+    oauth.py        OAuth scopes and client config builder
   scripts/
     auth_drive.py   Google Drive authorization (auto + manual modes)
     deploy.sh       One-liner deploy script for Docker hosts

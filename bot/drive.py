@@ -20,7 +20,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaInMemoryUpload
 
-from bot.oauth import CLIENT_CONFIG, SCOPES
+from bot.oauth import SCOPES, get_client_config
 from bot.state import get_state
 
 logger = logging.getLogger(__name__)
@@ -78,7 +78,7 @@ def _get_credentials():
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            flow = InstalledAppFlow.from_client_config(CLIENT_CONFIG, SCOPES)
+            flow = InstalledAppFlow.from_client_config(get_client_config(), SCOPES)
             creds = flow.run_local_server(port=0, open_browser=False)
         token_path.write_text(creds.to_json())
 

@@ -56,10 +56,24 @@ else
   read -rp " Your Telegram user ID (send /start to @userinfobot): " ADMIN_ID
   [[ -z "$ADMIN_ID" ]] && err "Admin Telegram ID is required."
 
+  echo ""
+  echo " Google Drive OAuth credentials"
+  echo " Go to: https://console.cloud.google.com/apis/credentials"
+  echo " Create an OAuth client ID → Desktop app, then copy the values below."
+  echo ""
+
+  read -rp " Google OAuth Client ID: " G_CLIENT_ID
+  [[ -z "$G_CLIENT_ID" ]] && err "Google Client ID is required."
+
+  read -rp " Google OAuth Client Secret: " G_CLIENT_SECRET
+  [[ -z "$G_CLIENT_SECRET" ]] && err "Google Client Secret is required."
+
   cat > "$ENV_FILE" << EOF
 TELEGRAM_BOT_TOKEN=${TG_TOKEN}
 GEMINI_API_KEY=${GEMINI_KEY}
 ADMIN_TELEGRAM_ID=${ADMIN_ID}
+GOOGLE_CLIENT_ID=${G_CLIENT_ID}
+GOOGLE_CLIENT_SECRET=${G_CLIENT_SECRET}
 EOF
   msg ".env created"
 fi
