@@ -1,0 +1,9 @@
+services:
+  magic-files:
+    build: .
+    container_name: magic-files
+    restart: unless-stopped
+    volumes:
+      - ./token.json:/app/token.json
+      - ./state.json:/app/state.json
+    env_file: .env
