@@ -5,6 +5,8 @@
 # Google Drive OAuth flow if the user hasn't authorized yet.
 set -euo pipefail
 
+cd "$(dirname "$(readlink -f "$0")")/.."
+
 SERVICE_NAME="magic-files"
 
 GN="\033[1;32m"  YW="\033[33m"  BL="\033[36m"  RD="\033[01;31m"  CL="\033[m"
